@@ -1,0 +1,186 @@
+library(tidyverse)
+library(readr)
+
+#set working directory
+setwd("C:/Users/User/OneDrive - BPS RI PUSAT/iwan/Karir/ELearning/Indathon 2024/indathon-round1-2024")
+
+#get all names of file
+file_names=list.files(path = getwd())
+
+# Create a list to hold the data frames
+data_frames_list <- list()
+
+# Read each CSV file into a data frame and add it to the list
+for (file in file_names) {
+  file_name <- tools::file_path_sans_ext(basename(file))
+  data_frames_list[[file_name]] <- read_delim(file,delim = ";")
+}
+
+# Access individual data frames using their names
+df1 <- data_frames_list$jumlah_armada_tj
+df2 <- data_frames_list$jumlah_penumpang_lrt
+df3 <- data_frames_list$jumlah_penumpang_mrt
+df4 <- data_frames_list$jumlah_perjalanan_lrt
+df5 <- data_frames_list$jumlah_perjalanan_mrt
+df6 <- data_frames_list$training_jumlah_penumpang_tj
+df7 <- data_frames_list$testing_jumlah_penumpang_tj
+
+#Join Data Feature
+df8 <- df1 %>%
+  inner_join(df2,by=c("bulan","tahun")) %>%
+  inner_join(df3,by=c("bulan","tahun")) %>%
+  inner_join(df4,by=c("bulan","tahun")) %>%
+  inner_join(df5,by=c("bulan","tahun"))
+
+#create combination month and year with expand grid
+month_year <- expand_grid(
+  bulan = 1:12,
+  tahun = 2015:2022
+)
+
+#calculate mean and standard deviation from each feature variable
+df_summ<-df8 %>%
+  summarise(across(c("jumlah_armada_tj","jumlah_penumpang.x",
+                     "jumlah_penumpang.y","jumlah_perjalanan.x",
+                     "jumlah_perjalanan.y"),list(mean=mean,sd=sd)))
+
+#add dummy feature value for backcast 2022 - 2015
+df9 <- month_year %>%
+  mutate(jumlah_armada_tj=median(rnorm(1000, mean=df_summ$jumlah_armada_tj_mean,
+                                sd=df_summ$jumlah_armada_tj_sd)),
+         jumlah_penumpang.x=median(rnorm(1000,mean=df_summ$jumlah_penumpang.x_mean,
+                                  sd=df_summ$jumlah_penumpang.x_sd)),
+         jumlah_penumpang.y=median(rnorm(1000,mean=df_summ$jumlah_penumpang.y_mean,
+                                  sd=df_summ$jumlah_penumpang.y_sd)),
+         jumlah_perjalanan.x=median(rnorm(1000,mean=df_summ$jumlah_perjalanan.x_mean,
+                                   sd=df_summ$jumlah_perjalanan.x_sd)),
+         jumlah_perjalanan.y=median(rnorm(1000,mean=df_summ$jumlah_perjalanan.y_mean,
+                                   sd=df_summ$jumlah_perjalanan.y_sd)))
+
+#Join df9 dengan df8
+df10<-bind_rows(df9,df8)
+
+#models
+library(caret)
+library(randomForest)
+library(xgboost)
+library(nnet)
+
+rf_best <- data.frame()
+xgb_best <- data.frame()
+nnet2_best <- data.frame()
+
+set.seed(3456)
+
+#Join Inner df6 dengan df10
+train_data <- df6 %>%
+  inner_join(df10,by=c("bulan","tahun"))
+
+#Join Inner df7 dengan df10
+test_data <- df7 %>%
+  inner_join(df10,by=c("bulan","tahun"))
+
+# Cross Validation (K-fold)
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+)
+
+#train the model using random forest
+rf <- train(
+  jumlah_penumpang ~ .,
+  data = train_data,
+  method = 'rf',
+  preProcess = c("center", "scale", "nzv"),
+  trControl = ctrl
+)
+
+rf_imp = varImp(rf, scale = FALSE)
+rf_best = rbind(rf_best,rf$results[which.max(rf$results$Rsquared),])
+
+#train the model using xgboost
+xgb <- train(
+  jumlah_penumpang ~ .,
+  data = train_data,
+  method = 'xgbTree',
+  preProcess = c("center", "scale", "nzv"),
+  trControl = ctrl
+)
+
+xgb_imp = varImp(xgb, scale = FALSE)
+xgb_best = rbind(xgb_best,xgb$results[which.max(xgb$results$Rsquared),])
+
+
+#Plot the variable Importance
+print(plot(xgb_imp, top = 20))
+
+# neuralnet 1 layer
+grid <-  expand.grid(size = seq(from = 1, to = 10, by = 1),
+                     decay = seq(from = 0.1, to = 0.5, by = 0.1))
+system.time(nnet2 <- train(
+  jumlah_penumpang ~ .,
+  data = train_data,
+  method = 'nnet',
+  tuneGrid = grid,
+  preProcess = c("center", "scale", "nzv"),
+  trControl = ctrl
+))
+
+nnet2_imp = varImp(nnet2, scale = FALSE)
+nnet2_best = rbind(nnet2_best,nnet2$results[which.max(nnet2$results$Rsquared),])
+
+#Plot the variable Importance
+print(plot(nnet2_imp, top = 20))
+#Hasil dari nueral network TIDAK BERHASIL karena SAMPELNYA YANG KURANG (MUNGKIN)
+
+write_xlsx(x=rf_best, path ="rf_best.xlsx")
+write_xlsx(x=xgb_best, path ="xgb_best.xlsx")
+write_xlsx(x=nnet2_best, path ="nnet2_best.xlsx")
+
+# Make predictions using the test data set
+rf.pred <- predict(rf, test_data)
+print(rf.pred)
+nn.pred <- predict(nnet2, test_data)
+print(nn.pred)
+xgb.pred <- predict(xgb, test_data)
+print(xgb.pred)
+
+#Memprediksi Jumlah Penumpang Bulan Juni 2024
+library(forecast)
+
+#karena RMSE Random Forest lebih kecil dari XGB, maka menggunakan RF
+df11<-data.frame(rf.pred)
+df12<-expand.grid(bulan=1:5,tahun=2024) %>%
+  mutate(jumlah_penumpang=df11$rf.pred)
+
+df13<-bind_rows(df6,df12)
+df14<-df13 %>%
+  select("jumlah_penumpang")
+
+# Sample data (replace with your data)
+df14 <- ts(df14, start = c(2015,1), frequency = 113)  # Assuming monthly data
+
+# Explore data (optional)
+plot(df14)
+acf(df14)
+pacf(df14)
+
+# Fit ARIMA model
+fit <- arima(df14, order = c(1, 1, 0))  # Replace p, d, q with optimal values
+
+# Forecast
+forecast <- forecast(fit, h = 1)  # Forecast for the next 1 periods
+
+# Plot forecast
+plot(forecast)
+print(forecast)
+#make forecast to dataframe
+df15<-data.frame(forecast)
+
+#Final Answer
+df16<-expand.grid(bulan=6,tahun=2024) %>%
+  mutate(jumlah_penumpang=df15$Point.Forecast)
+
+submission<-bind_rows(df12,df16)
+
+write.csv2(x=submission, file="submission_file.csv")
